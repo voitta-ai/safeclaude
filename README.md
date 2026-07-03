@@ -18,10 +18,10 @@ entitlements** — works on a stock Mac.
 ## Build
 
 ```bash
-git clone <this repo> && cd safeclaude
+git clone <this repo> && cd safeclaude   # repo clones into ./safeclaude
 
 # 1. engine (Go NFS server + policy + report renderer)
-cd engine
+cd safeclaude/engine
 go build -o safeclaude-engine .
 
 # 2. menu bar app (SwiftUI, built with SPM, wrapped into a .app bundle)
@@ -184,16 +184,16 @@ printf '{"cmd":"report"}\n'   | nc -U "$SOCK"   # returns report path
                                 └───────────────┘  └─────────────────┘
 ```
 
-- `engine/classify.go` — path → category (claude-skill, claude-hook,
+- `safeclaude/engine/classify.go` — path → category (claude-skill, claude-hook,
   claude-memory, mcp-config, secret, …)
-- `engine/rules.go` — atomically hot-swappable rule set; "approve" appends an
+- `safeclaude/engine/rules.go` — atomically hot-swappable rule set; "approve" appends an
   exact-path allow override
-- `engine/control.go` — unix-socket JSON-lines API (stats, subscribe,
+- `safeclaude/engine/control.go` — unix-socket JSON-lines API (stats, subscribe,
   set_rule, approve, report)
-- `engine/report.go` — report renderer; light = Quarterly editorial white,
+- `safeclaude/engine/report.go` — report renderer; light = Quarterly editorial white,
   dark = "Data View" navy, via `prefers-color-scheme`
-- `app/Sources/SafeClaudeBar/` — `MenuBarExtra` UI + socket client
-- `safeclaude` — wrapper: engine → mount → app → run → unmount → report
+- `safeclaude/app/Sources/SafeClaudeBar/` — `MenuBarExtra` UI + socket client
+- `safeclaude/safeclaude` — wrapper: engine → mount → app → run → unmount → report
 
 ## Troubleshooting
 
