@@ -1,0 +1,18 @@
+# Sibling projects tracked elsewhere — not part of this repo
+domain/
+dragonlamp/
+
+# Python
+__pycache__/
+*.pyc
+
+# Large binary exports
+*.stl
+
+# SafeClaude build artifacts (source builds these; do not commit)
+safeclaude/app/.build/
+safeclaude/app/SafeClaude.app/
+safeclaude/engine/safeclaude-engine
+
+# macOS
+.DS_Store

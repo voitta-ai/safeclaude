@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# safeclaude — run claude (or any command) inside a policy-enforced, fully
+# audited view of a repo, with a menu bar companion app.
+#
+#   safeclaude <repo-dir> [command...]        default command: claude, else $SHELL
+#
+# Sessions are 1:1 with repos: the first invocation starts an engine and
+# mounts ~/.safeclaude/mounts/<repo-name>; further invocations on the same
+# repo JOIN that session (same mount, same engine). The last client to exit
+# unmounts, renders the report, and stops the engine. Session state lives in
+# ~/.safeclaude/sessions/<name>/ (repo path, engine pid, port, control.sock,
+# one pid-file per attached client).
+set -euo pipefail
+
+REPO="${1:?usage: safeclaude <repo-dir> [command...]}"
+shift || true
+REPO="$(cd "$REPO" && pwd)"
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE="$HERE/engine/safeclaude-engine"
+APP="$HERE/app/SafeClaude.app"
+[ -x "$ENGINE" ] || { echo "safeclaude: build engine first: (cd $HERE/engine && go build -o safeclaude-engine .)" >&2; exit 1; }
+
+BASE="$HOME/.safeclaude"
+mkdir -p "$BASE/logs" "$BASE/mounts" "$BASE/sessions"
+
+# ---- resolve session: join live session for this repo, reclaim stale ones,
+# ---- suffix only when a DIFFERENT repo with the same basename is live
+NAME="$(basename "$REPO")"
+n=1
+MODE=start
+while :; do
+  SESS="$BASE/sessions/$NAME"
+  MNT="$BASE/mounts/$NAME"
+  if [ -d "$SESS" ]; then
+    for c in "$SESS/clients"/*; do   # prune records of dead clients
+      [ -e "$c" ] || continue
+      kill -0 "$(basename "$c")" 2>/dev/null || rm -f "$c"
+    done
+    EPID="$(cat "$SESS/engine.pid" 2>/dev/null || true)"
+    SREPO="$(cat "$SESS/repo" 2>/dev/null || true)"
+    if [ -n "$EPID" ] && kill -0 "$EPID" 2>/dev/null && stat "$MNT" >/dev/null 2>&1; then
+      if [ "$SREPO" = "$REPO" ]; then
+        MODE=join
+        break
+      fi
+      n=$((n+1)); NAME="$(basename "$REPO")-$n"   # live session, different repo
+      continue
+    fi
+    # stale: engine dead or mount wedged — tear down and reuse the name
+    umount "$MNT" 2>/dev/null || umount -f "$MNT" 2>/dev/null || true
+    [ -n "$EPID" ] && kill "$EPID" 2>/dev/null || true
+    rm -rf "$SESS"
+  fi
+  break
+done
+
+SOCK="$SESS/control.sock"
+mkdir -p "$SESS/clients" "$MNT"
+echo $$ > "$SESS/clients/$$"
+
+if [ "$MODE" = start ]; then
+  LOG="$BASE/logs/$NAME-$(date +%Y%m%d-%H%M%S).log"
+  echo "$REPO" > "$SESS/repo"
+  echo "$LOG" > "$SESS/log"
+  "$ENGINE" -root "$REPO" -name "$NAME" -socket "$SOCK" -log "$LOG" \
+    -rules "$SESS/rules.json" -defaults "$BASE/default-rules.json" >"$SESS/port.txt" 2>/dev/null &
+  SRV=$!
+  echo "$SRV" > "$SESS/engine.pid"
+
+  PORT=""
+  for _ in $(seq 1 50); do
+    PORT="$(awk '/^LISTENING/{print $2}' "$SESS/port.txt" 2>/dev/null || true)"
+    [ -n "$PORT" ] && break
+    sleep 0.1
+  done
+  [ -n "$PORT" ] || { echo "safeclaude: engine failed to start" >&2; kill "$SRV" 2>/dev/null || true; rm -rf "$SESS"; exit 1; }
+else
+  LOG="$(cat "$SESS/log" 2>/dev/null || true)"
+fi
+
+cleanup() {
+  cd / 2>/dev/null || true
+  rm -f "$SESS/clients/$$"
+  for c in "$SESS/clients"/*; do   # other clients still attached → leave it up
+    [ -e "$c" ] || continue
+    if kill -0 "$(basename "$c")" 2>/dev/null; then
+      echo "safeclaude: detached ($(basename "$c") still active, session stays up)" >&2
+      return 0
+    fi
+    rm -f "$c"
+  done
+  # last one out: report, unmount, stop engine, drop session state
+  REPORT="$(printf '{"cmd":"report"}\n' | nc -U "$SOCK" 2>/dev/null \
+      | /usr/bin/python3 -c 'import sys,json;print(json.loads(sys.stdin.readline()).get("report",""))' 2>/dev/null || true)"
+  umount "$MNT" 2>/dev/null || umount -f "$MNT" 2>/dev/null || true
+  rmdir "$MNT" 2>/dev/null || true
+  kill "$(cat "$SESS/engine.pid" 2>/dev/null)" 2>/dev/null || true
+  rm -rf "$SESS"
+  echo "safeclaude: session ended" >&2
+  [ -n "$REPORT" ] && echo "safeclaude: report → $REPORT" >&2
+  [ -n "$LOG" ] && echo "safeclaude: audit log → $LOG" >&2
+}
+trap cleanup EXIT
+
+if [ "$MODE" = start ]; then
+  # nonegnamecache + 1s attribute cache: live policy toggles (hide→allow) take
+  # effect immediately instead of being masked by the NFS client's caches.
+  mount_nfs -o noresvport,nolocks,tcp,vers=3,port="$PORT",mountport="$PORT",nonegnamecache,acregmin=1,acregmax=1,acdirmin=1,acdirmax=1 "localhost:/" "$MNT"
+  echo "safeclaude: guarded view of $REPO"
+else
+  echo "safeclaude: joined live session for $REPO"
+fi
+
+# menu bar companion (idempotent: -g = don't steal focus; already-running is a no-op)
+[ -d "$APP" ] && open -g "$APP" 2>/dev/null || true
+
+echo "safeclaude:   mounted at  $MNT"
+[ -n "$LOG" ] && echo "safeclaude:   audit log   $LOG"
+echo
+
+cd "$MNT"
+if [ $# -gt 0 ]; then
+  "$@"
+elif command -v claude >/dev/null 2>&1; then
+  claude
+else
+  "${SHELL:-/bin/zsh}"
+fi
