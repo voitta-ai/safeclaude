@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,8 @@ type RuleSet struct {
 	// the dangerous case, so they get their own axis).
 	Write     map[Category]Action `json:"write"`
 	Overrides []PathOverride      `json:"overrides"`
+	// Meta controls sit between path overrides and the category grid.
+	Meta *MetaControls `json:"meta,omitempty"`
 }
 
 // DenyAllRules is the factory default: everything blocked-with-notification
@@ -64,6 +67,7 @@ func DenyAllRules() *RuleSet {
 	// and rarely sensitive; the danger is writes (fsmonitor/hooksPath), which
 	// stay gated — as do hook reads and writes.
 	r.Read[CatVCSConfig] = ActAllow
+	r.Meta = DefaultMeta()
 	return r
 }
 
@@ -79,19 +83,56 @@ func (dst *RuleSet) merge(src *RuleSet) {
 	if src.Overrides != nil {
 		dst.Overrides = src.Overrides
 	}
+	if src.Meta != nil {
+		m := *src.Meta
+		m.fillFrom(dst.Meta) // dst always carries factory meta
+		dst.Meta = &m
+	}
 }
 
-// Decide returns the action for an operation on a path.
-func (r *RuleSet) Decide(op, path string, cat Category) Action {
+func isWriteOp(op string) bool {
+	switch op {
+	case "WRITE", "CREATE", "DELETE", "RENAME", "MKDIR", "SYMLNK", "CHMOD", "CHOWN":
+		return true
+	}
+	return false
+}
+
+// Decide returns the action for an operation on a path. Precedence:
+// explicit path overrides, then meta controls, then the category grid.
+// mine is consulted lazily, only when a MetaSelf switch applies.
+func (r *RuleSet) Decide(op, path string, cat Category, mine func(string, Category) bool) Action {
 	clean := strings.Trim(filepath.ToSlash(filepath.Clean("/"+path)), "/")
 	for _, o := range r.Overrides {
 		if ok, _ := filepath.Match(o.Glob, clean); ok || o.Glob == clean {
 			return o.Action
 		}
 	}
+	writeOp := isWriteOp(op)
+	// Enumerating a .claude directory itself is the gateway Claude Code's
+	// startup scan and skill discovery walk through; it reveals only entry
+	// names. Depending on the client, that arrives as LIST (READDIR) or as a
+	// plain READ open of the directory — exempt both. The guard belongs on
+	// the files inside, which each get their own decision.
+	if (op == "LIST" || op == "READ") && (clean == ".claude" || strings.HasSuffix(clean, "/.claude")) {
+		return ActAllow
+	}
+	if writeOp && cat.IsClaudeArtifact() && r.Meta.claudeWritesAllowed() {
+		return ActAllow
+	}
+	switch r.Meta.mode(cat, writeOp) {
+	case MetaOff:
+		return ActBlock
+	case MetaAsk:
+		return ActAsk
+	case MetaSelf:
+		if !writeOp && mine != nil && mine(clean, cat) {
+			return ActAllow
+		}
+		// not provably self-authored (or a mutation): the grid decides
+	}
 	table := r.Read
-	switch op {
-	case "WRITE", "CREATE", "DELETE", "RENAME", "MKDIR", "SYMLNK", "CHMOD", "CHOWN":
+	if writeOp {
 		table = r.Write
 	}
 	if a, ok := table[cat]; ok {
@@ -105,6 +146,14 @@ func (r *RuleSet) clone() *RuleSet {
 		Read:      make(map[Category]Action, len(r.Read)),
 		Write:     make(map[Category]Action, len(r.Write)),
 		Overrides: append([]PathOverride(nil), r.Overrides...),
+	}
+	if r.Meta != nil {
+		m := *r.Meta
+		if r.Meta.AllowClaudeWrites != nil {
+			b := *r.Meta.AllowClaudeWrites
+			m.AllowClaudeWrites = &b
+		}
+		n.Meta = &m
 	}
 	for k, v := range r.Read {
 		n.Read[k] = v
@@ -190,6 +239,39 @@ func (r *Rules) Approve(path string) {
 // notify-flavored, so it stops re-alerting on every retry.
 func (r *Rules) DenyPath(path string) {
 	r.override(path, ActBlock)
+}
+
+// SetMeta updates one meta control by wire name.
+func (r *Rules) SetMeta(name, value string) error {
+	set := r.Current().clone()
+	if set.Meta == nil {
+		set.Meta = DefaultMeta()
+	}
+	mode := MetaMode(value)
+	switch name {
+	case "allow_claude_writes":
+		v := value == "on" || value == "true" || value == "yes"
+		set.Meta.AllowClaudeWrites = &v
+	case "local_skills", "local_hooks", "memory", "git_controls":
+		if !mode.valid() {
+			return fmt.Errorf("bad meta value %q (want off|self|ask)", value)
+		}
+		switch name {
+		case "local_skills":
+			set.Meta.LocalSkills = mode
+		case "local_hooks":
+			set.Meta.LocalHooks = mode
+		case "memory":
+			set.Meta.Memory = mode
+		case "git_controls":
+			set.Meta.GitControls = mode
+		}
+	default:
+		return fmt.Errorf("unknown meta control %q", name)
+	}
+	r.cur.Store(set)
+	r.persist(set)
+	return nil
 }
 
 func (r *Rules) override(path string, act Action) {

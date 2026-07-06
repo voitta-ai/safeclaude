@@ -3,16 +3,20 @@ package main
 import (
 	"fmt"
 	"html/template"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // RenderReport writes a self-contained McKinsey Quarterly–styled HTML session
 // report and returns its path. Light mode follows the magazine's editorial
 // white pages; dark mode follows its navy "Data View" exhibit pages.
-func RenderReport(bus *EventBus, rules *Rules, dir, session string) (string, error) {
+func RenderReport(bus *EventBus, rules *Rules, self *SelfCheck, dir, session string) (string, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
@@ -129,6 +133,7 @@ func RenderReport(bus *EventBus, rules *Rules, dir, session string) (string, err
 		"ArtifactEvents": artifactEvents,
 		"Sensitive":      sensitive,
 		"Denies":         denies,
+		"Inventory":      inventoryGroups(stats.Repo, rules.Current(), self),
 		"Generated":      time.Now().Format("Jan 2, 2006 15:04:05"),
 	}
 
@@ -143,6 +148,171 @@ func RenderReport(bus *EventBus, rules *Rules, dir, session string) (string, err
 		return "", err
 	}
 	return out, nil
+}
+
+// InvItem is one file in the local agent-steering inventory: a skill, hook,
+// memory file, or git hook found in the repo at report time, with its
+// content embedded so the report can show it inline.
+type InvItem struct {
+	Path      string // repo-relative
+	Size      string
+	Modified  string
+	Origin    string // "not in git" | "committed by <email>" | "in git"
+	Foreign   bool   // committed by someone other than the repo's user
+	Content   string
+	Truncated bool
+	Binary    bool
+	// Policy verdicts under the session rules at report time, computed
+	// through the same Decide path the live mount uses.
+	ReadLabel  string
+	ReadClass  string // v-allow | v-ask | v-block | v-hide
+	WriteLabel string
+	WriteClass string
+}
+
+const invMaxFiles = 40           // per group
+const invMaxContent = 64 * 1024  // bytes of content embedded per file
+
+// verdictFor renders one policy decision as a badge label + CSS class,
+// annotating *why* when a meta layer produced it ("self", "grid", "toggle").
+func verdictFor(rs *RuleSet, self *SelfCheck, op, path string, cat Category) (string, string) {
+	mine := func(p string, c Category) bool { return self != nil && self.Mine(p, c) }
+	act := rs.Decide(op, path, cat, mine)
+
+	via := ""
+	if rs.Meta.mode(cat, isWriteOp(op)) == MetaSelf {
+		// Self only ever auto-allows reads; mutations always fall to the grid.
+		if !isWriteOp(op) && mine(path, cat) {
+			via = " · self"
+		} else {
+			via = " · grid"
+		}
+	} else if isWriteOp(op) && cat.IsClaudeArtifact() && rs.Meta.claudeWritesAllowed() && act == ActAllow {
+		via = " · toggle"
+	}
+
+	switch act {
+	case ActAllow:
+		return "allow" + via, "v-allow"
+	case ActAsk:
+		return "ask" + via, "v-ask"
+	case ActHide:
+		return "hide" + via, "v-hide"
+	case ActNotify:
+		return "block+notify" + via, "v-block"
+	default:
+		return "block" + via, "v-block"
+	}
+}
+
+// inventoryGroups scans the repo for local skills, hooks, memory files and
+// git hooks — the things that steer the agent — and returns them grouped
+// for the report, content included. The scan reads the disk directly and is
+// NOT subject to session policy: hidden or blocked files still appear here;
+// the verdict badges show how the live policy would treat each one.
+func inventoryGroups(root string, rs *RuleSet, self *SelfCheck) []map[string]any {
+	groups := []struct {
+		title, blurb string
+		cat          Category
+	}{
+		{"Local skills", "Skill files shape how Claude approaches tasks in this repo.", CatClaudeSkill},
+		{"Local hooks", "Claude hooks run automatically on tool calls — code execution.", CatClaudeHook},
+		{"Memory", "CLAUDE.md and memory files are standing instructions loaded into context.", CatClaudeMemory},
+		{"Git hooks", "Git executes these on commit, checkout, merge — outside Claude's sandbox.", CatVCSHooks},
+	}
+	byCat := map[Category][]InvItem{}
+
+	email := ""
+	if out, err := exec.Command("git", "-C", root, "config", "user.email").Output(); err == nil {
+		email = strings.TrimSpace(string(out))
+	}
+
+	addFile := func(cat Category, rel string, info fs.FileInfo) {
+		if len(byCat[cat]) >= invMaxFiles {
+			return
+		}
+		it := InvItem{
+			Path:     rel,
+			Size:     fmt.Sprintf("%d B", info.Size()),
+			Modified: info.ModTime().Format("Jan 2 15:04"),
+		}
+		if info.Size() >= 1024 {
+			it.Size = fmt.Sprintf("%.1f KB", float64(info.Size())/1024)
+		}
+		if cat == CatVCSHooks {
+			it.Origin = "not tracked by git" // .git internals never are
+		} else if out, err := exec.Command("git", "-C", root, "ls-files", "--error-unmatch", rel).Output(); err != nil || len(out) == 0 {
+			it.Origin = "not in git"
+		} else if a, err := exec.Command("git", "-C", root, "log", "-1", "--format=%ae", "--", rel).Output(); err == nil && strings.TrimSpace(string(a)) != "" {
+			author := strings.TrimSpace(string(a))
+			it.Origin = "committed by " + author
+			it.Foreign = email == "" || !strings.EqualFold(author, email)
+		} else {
+			it.Origin = "in git"
+		}
+		it.ReadLabel, it.ReadClass = verdictFor(rs, self, "READ", rel, cat)
+		it.WriteLabel, it.WriteClass = verdictFor(rs, self, "WRITE", rel, cat)
+		data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
+		if err == nil {
+			if len(data) > invMaxContent {
+				data = data[:invMaxContent]
+				it.Truncated = true
+			}
+			if utf8.Valid(data) && !strings.ContainsRune(string(data), 0) {
+				it.Content = string(data)
+			} else {
+				it.Binary = true
+			}
+		}
+		byCat[cat] = append(byCat[cat], it)
+	}
+
+	// Targeted walk: the whole tree minus .git (git hooks are picked up
+	// separately) and the usual dependency dirs; Classify decides what
+	// counts, so nested .claude layouts and stray CLAUDE.md files are found.
+	skipDirs := map[string]bool{".git": true, "node_modules": true, "vendor": true, ".venv": true}
+	_ = filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if p != root && skipDirs[d.Name()] {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		rel, _ := filepath.Rel(root, p)
+		rel = filepath.ToSlash(rel)
+		switch cat := Classify(rel); cat {
+		case CatClaudeSkill, CatClaudeHook, CatClaudeMemory:
+			if info, err := d.Info(); err == nil {
+				addFile(cat, rel, info)
+			}
+		}
+		return nil
+	})
+
+	// git hooks: only real hooks, not the .sample noise git ships
+	if entries, err := os.ReadDir(filepath.Join(root, ".git", "hooks")); err == nil {
+		for _, e := range entries {
+			if e.IsDir() || strings.HasSuffix(e.Name(), ".sample") {
+				continue
+			}
+			if info, err := e.Info(); err == nil {
+				addFile(CatVCSHooks, ".git/hooks/"+e.Name(), info)
+			}
+		}
+	}
+
+	var out []map[string]any
+	for _, g := range groups {
+		items := byCat[g.cat]
+		sort.Slice(items, func(i, j int) bool { return items[i].Path < items[j].Path })
+		out = append(out, map[string]any{
+			"Title": g.title, "Blurb": g.blurb, "Items": items, "Count": len(items),
+		})
+	}
+	return out
 }
 
 // headlineFor writes the cover line the way the Quarterly would: the single
@@ -343,6 +513,46 @@ th.num-col { text-align: right; }
 .footnote b { color: var(--ink); }
 .empty { font-size: 13px; color: var(--muted); font-style: italic; padding: 10px 0; }
 
+/* inventory — collapsible file viewers */
+.inv-group { margin-top: 30px; }
+.inv-head { display: flex; align-items: baseline; gap: 10px; }
+.inv-head .cnt {
+  font-family: var(--serif); font-size: 26px; color: var(--accent); line-height: 1;
+}
+.inv-head .ttl { font-weight: 700; font-size: 14px; }
+.inv-blurb { font-size: 12px; color: var(--muted); margin: 3px 0 10px; }
+details.inv {
+  border: 1px solid var(--hairline); border-left: 3px solid var(--accent);
+  margin-bottom: 8px; background: var(--panel);
+}
+/* left edge = what a READ would get under the live session policy */
+details.inv.v-allow { border-left-color: var(--chart-secret); }
+details.inv.v-ask   { border-left-color: var(--warn); }
+details.inv.v-block { border-left-color: var(--crit); }
+details.inv.v-hide  { border-left-color: var(--muted); }
+.tag.v-allow { background: var(--chart-secret); color: #fff; }
+.tag.v-ask   { background: var(--warn); color: #1a1a1a; }
+.tag.v-block { background: var(--crit); color: #fff; }
+.tag.v-hide  { border: 1px solid var(--muted); color: var(--muted); }
+.vlbl { font-size: 9px; letter-spacing: .14em; color: var(--muted); text-transform: uppercase; }
+details.inv > summary {
+  cursor: pointer; list-style: none; padding: 9px 14px;
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+}
+details.inv > summary::-webkit-details-marker { display: none; }
+details.inv > summary::before { content: "+"; font-weight: 700; color: var(--accent); width: 12px; }
+details.inv[open] > summary::before { content: "\2212"; }
+.inv-path { font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 12px; font-weight: 600; word-break: break-all; }
+.inv-meta { font-size: 10.5px; color: var(--muted); white-space: nowrap; margin-left: auto; }
+.inv-meta .tag { margin-left: 8px; }
+details.inv pre {
+  margin: 0; padding: 14px 16px; overflow-x: auto; max-height: 420px; overflow-y: auto;
+  border-top: 1px solid var(--hairline);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px; line-height: 1.5;
+  white-space: pre-wrap; word-break: break-word;
+}
+.inv-trunc { font-size: 10.5px; color: var(--warn); padding: 6px 16px; border-top: 1px dotted var(--hairline); }
+
 .endmark { text-align: center; margin-top: 70px; }
 .endmark .sq { display: inline-block; width: 10px; height: 10px; background: var(--accent); }
 @media print { body { background: #fff; color: #000; } .page { padding: 10px; } }
@@ -472,7 +682,42 @@ th.num-col { text-align: right; }
     {{else}}
     <p class="empty">Nothing was denied this session.</p>
     {{end}}
-    <p class="footnote"><b>Source:</b> SafeClaude audit stream, {{.RepoFull}}. Generated {{.Generated}}. All timestamps local.</p>
+  </section>
+
+  <!-- ================= Inventory ================= -->
+  <section class="section">
+    <hr class="rule-heavy">
+    <h3 class="dept">Inventory</h3>
+    <div class="blackbar"></div>
+
+    <p class="exhibit-label">Exhibit 5</p>
+    <p class="exhibit-title">Agent-steering content present in this repo, <em>as of report time</em></p>
+
+    {{range .Inventory}}
+    <div class="inv-group">
+      <div class="inv-head"><span class="cnt">{{.Count}}</span><span class="ttl">{{.Title}}</span></div>
+      <p class="inv-blurb">{{.Blurb}}</p>
+      {{if .Items}}
+        {{range .Items}}
+        <details class="inv {{.ReadClass}}">
+          <summary>
+            <span class="inv-path">{{.Path}}</span>
+            <span class="inv-meta">
+              <span class="vlbl">read</span> <span class="tag {{.ReadClass}}">{{.ReadLabel}}</span>
+              <span class="vlbl">write</span> <span class="tag {{.WriteClass}}">{{.WriteLabel}}</span>
+              &nbsp;{{.Size}} &middot; {{.Modified}} &middot; {{.Origin}}{{if .Foreign}}<span class="tag warning">foreign</span>{{end}}
+            </span>
+          </summary>
+          {{if .Binary}}<pre>(binary content not shown)</pre>{{else}}<pre>{{.Content}}</pre>{{end}}
+          {{if .Truncated}}<div class="inv-trunc">Truncated — showing the first 64 KB.</div>{{end}}
+        </details>
+        {{end}}
+      {{else}}
+      <p class="empty">None found.</p>
+      {{end}}
+    </div>
+    {{end}}
+    <p class="footnote"><b>Note:</b> Click a row to expand the file's full content. The inventory is gathered directly from disk and ignores session policy — files the agent cannot see or read still appear here. Every <code>.claude</code> folder in the repo is scanned, nested ones included. The <b>read</b>/<b>write</b> badges show what the live session policy would decide for that file right now (path overrides, meta switches, then the category grid): "self" = allowed because the file is yours, "grid" = the self test failed and the category grid decided, "toggle" = permitted by Allow&nbsp;Claude&nbsp;writes. "Foreign" marks files whose last commit is not by this repo's configured git user — content you may not have written. <b>Source:</b> SafeClaude audit stream and repo scan, {{.RepoFull}}. Generated {{.Generated}}. All timestamps local.</p>
   </section>
 
   <div class="endmark"><span class="sq"></span></div>

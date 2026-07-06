@@ -21,10 +21,16 @@ type PolicyFS struct {
 	bus      *EventBus
 	audit    *log.Logger
 	asks     *Asks
+	self     *SelfCheck
 }
 
-func NewPolicyFS(inner billy.Filesystem, realRoot string, rules *Rules, bus *EventBus, audit *log.Logger, asks *Asks) *PolicyFS {
-	return &PolicyFS{inner: inner, realRoot: realRoot, rules: rules, bus: bus, audit: audit, asks: asks}
+func NewPolicyFS(inner billy.Filesystem, realRoot string, rules *Rules, bus *EventBus, audit *log.Logger, asks *Asks, self *SelfCheck) *PolicyFS {
+	return &PolicyFS{inner: inner, realRoot: realRoot, rules: rules, bus: bus, audit: audit, asks: asks, self: self}
+}
+
+// mine adapts SelfCheck for RuleSet.Decide (MetaSelf switches).
+func (p *PolicyFS) mine(path string, cat Category) bool {
+	return p.self != nil && p.self.Mine(path, cat)
 }
 
 var errPermission = os.ErrPermission
@@ -68,7 +74,7 @@ func (p *PolicyFS) decide(op, path string) error {
 	// but keep `rel` for the audit so nothing is hidden from the record.
 	dpath := decisionPath(rel)
 	cat := Classify(dpath)
-	act := p.rules.Current().Decide(op, dpath, cat)
+	act := p.rules.Current().Decide(op, dpath, cat, p.mine)
 
 	action := "allow"
 	var err error
@@ -108,7 +114,7 @@ func (p *PolicyFS) decide(op, path string) error {
 // so directory walks don't flood the event stream.
 func (p *PolicyFS) hidden(path string) bool {
 	dpath := decisionPath(p.rel(path))
-	return p.rules.Current().Decide("READ", dpath, Classify(dpath)) == ActHide
+	return p.rules.Current().Decide("READ", dpath, Classify(dpath), p.mine) == ActHide
 }
 
 func (p *PolicyFS) Open(filename string) (billy.File, error) {
@@ -237,7 +243,7 @@ func (p *PolicyFS) Chroot(path string) (billy.Filesystem, error) {
 	if err != nil {
 		return nil, err
 	}
-	child := NewPolicyFS(sub, filepath.Join(p.realRoot, path), p.rules, p.bus, p.audit, p.asks)
+	child := NewPolicyFS(sub, filepath.Join(p.realRoot, path), p.rules, p.bus, p.audit, p.asks, p.self)
 	child.relBase = p.rel(path)
 	return child, nil
 }

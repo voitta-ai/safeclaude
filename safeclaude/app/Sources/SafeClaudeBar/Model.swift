@@ -43,10 +43,31 @@ struct PathOverride: Codable {
     var action: String
 }
 
+/// Meta controls: the layer between explicit path overrides and the
+/// category grid (overrides > meta > grid). Mirrors engine/meta.go.
+struct MetaControls: Codable, Equatable {
+    var allowClaudeWrites: Bool? = true
+    var localSkills: String? = "self"
+    var localHooks: String? = "self"
+    var memory: String? = "self"
+    var gitControls: String? = "self"
+
+    enum CodingKeys: String, CodingKey {
+        case allowClaudeWrites = "allow_claude_writes"
+        case localSkills = "local_skills"
+        case localHooks = "local_hooks"
+        case memory
+        case gitControls = "git_controls"
+    }
+
+    static let factory = MetaControls()
+}
+
 struct RuleSet: Codable {
     var read: [String: String]
     var write: [String: String]
     var overrides: [PathOverride]? = nil
+    var meta: MetaControls? = nil
 
     /// Factory default: agent-steering and executable content blocked-with-
     /// notification; ordinary project files ("source"), inert git metadata,
@@ -57,7 +78,7 @@ struct RuleSet: Codable {
         all["source"] = "allow"
         var write = all
         all["vcs-config"] = "allow" // reads only; writes stay gated
-        return RuleSet(read: all, write: write)
+        return RuleSet(read: all, write: write, meta: .factory)
     }
 }
 
@@ -167,6 +188,66 @@ let actionChoices: [(key: String, label: String)] = [
     ("notify", "Block & Notify"),
 ]
 
+// MARK: - Meta controls (third policy column)
+
+/// The three positions of a meta switch, in display order.
+let metaModeChoices: [(key: String, label: String)] = [
+    ("off", "Block"),
+    ("self", "Self"),
+    ("ask", "Ask"),
+]
+
+struct MetaSwitchInfo {
+    let key: String    // wire name for set_meta
+    let label: String
+    let help: String
+}
+
+let metaSwitches: [MetaSwitchInfo] = [
+    .init(key: "local_skills", label: "Local skills",
+          help: "Reading skills in this repo. Block: none readable. Self: only skills not yet in git, or whose last commit is yours. Ask: every read pauses for approval."),
+    .init(key: "local_hooks", label: "Local hooks",
+          help: "Reading Claude hooks in this repo. Block: none readable. Self: only hooks not yet in git, or whose last commit is yours. Ask: every read pauses for approval."),
+    .init(key: "memory", label: "Memory",
+          help: "Reading CLAUDE.md / memory files. Block: none readable. Self: only memory not yet in git, or whose last commit is yours. Ask: every read pauses for approval."),
+    .init(key: "git_controls", label: "Git hooks & config",
+          help: "Git hooks and .git/config, reads and writes. Block: nothing. Self: reads allowed for files that predate the session; writes fall to the grid. Ask: pauses for approval."),
+]
+
+extension MetaControls {
+    func mode(for key: String) -> String {
+        switch key {
+        case "local_skills": return localSkills ?? "self"
+        case "local_hooks": return localHooks ?? "self"
+        case "memory": return memory ?? "self"
+        case "git_controls": return gitControls ?? "self"
+        default: return "self"
+        }
+    }
+
+    mutating func set(key: String, value: String) {
+        switch key {
+        case "allow_claude_writes": allowClaudeWrites = (value == "on")
+        case "local_skills": localSkills = value
+        case "local_hooks": localHooks = value
+        case "memory": memory = value
+        case "git_controls": gitControls = value
+        default: break
+        }
+    }
+
+    /// Fill fields absent from an older rules file with factory values.
+    func normalized() -> MetaControls {
+        var m = self
+        m.allowClaudeWrites = m.allowClaudeWrites ?? true
+        m.localSkills = m.localSkills ?? "self"
+        m.localHooks = m.localHooks ?? "self"
+        m.memory = m.memory ?? "self"
+        m.gitControls = m.gitControls ?? "self"
+        return m
+    }
+}
+
 /// A pending Ask pushed by an engine: the file operation is parked (the
 /// agent's call is blocked mid-syscall) until resolved or expired.
 struct PendingAsk: Codable, Identifiable {
@@ -197,6 +278,7 @@ final class DefaultPolicyStore: ObservableObject {
             base.read.merge(r.read) { _, new in new }
             base.write.merge(r.write) { _, new in new }
             base.overrides = r.overrides
+            if let m = r.meta { base.meta = m.normalized() }
             rules = base
         } else {
             save() // first run: materialize deny-all so the engine sees it too
@@ -209,6 +291,13 @@ final class DefaultPolicyStore: ObservableObject {
         } else {
             rules.read[category] = action
         }
+        save()
+    }
+
+    func setMeta(name: String, value: String) {
+        var m = rules.meta ?? .factory
+        m.set(key: name, value: value)
+        rules.meta = m
         save()
     }
 

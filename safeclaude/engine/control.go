@@ -25,11 +25,13 @@ type Control struct {
 }
 
 type ctrlRequest struct {
-	Cmd      string   `json:"cmd"` // subscribe | stats | get_rules | set_rule | approve | deny | resolve | pending | report | ping
+	Cmd      string   `json:"cmd"` // subscribe | stats | get_rules | set_rule | set_meta | approve | deny | resolve | pending | report | shutdown | ping
 	Axis     string   `json:"axis,omitempty"`
 	Category Category `json:"category,omitempty"`
 	Action   Action   `json:"action,omitempty"`
 	Path     string   `json:"path,omitempty"`
+	Name     string   `json:"name,omitempty"`  // set_meta: control name
+	Value    string   `json:"value,omitempty"` // set_meta: on|off / off|self|ask
 	ID       string   `json:"id,omitempty"`       // resolve: ask id
 	Allow    bool     `json:"allow,omitempty"`    // resolve: verdict
 	Remember bool     `json:"remember,omitempty"` // resolve: persist as path override
@@ -118,6 +120,13 @@ func (c *Control) handle(conn net.Conn) {
 			}
 			c.rules.SetCategory(req.Axis, req.Category, req.Action)
 			send(ctrlReply{Type: "rules", Rules: c.rules.Current()})
+		case "set_meta":
+			if err := c.rules.SetMeta(req.Name, req.Value); err != nil {
+				send(ctrlReply{Type: "error", Error: err.Error()})
+				continue
+			}
+			log.Printf("control: meta %s = %s", req.Name, req.Value)
+			send(ctrlReply{Type: "rules", Rules: c.rules.Current()})
 		case "approve":
 			if req.Path == "" {
 				send(ctrlReply{Type: "error", Error: "approve needs path"})
@@ -158,6 +167,15 @@ func (c *Control) handle(conn net.Conn) {
 			} else {
 				send(ctrlReply{Type: "report", Report: path})
 			}
+		case "shutdown":
+			// Session deletion: the app unmounts and removes state after
+			// this ack; the brief delay lets the reply flush first.
+			log.Printf("control: shutdown requested")
+			send(ctrlReply{Type: "ok"})
+			go func() {
+				time.Sleep(200 * time.Millisecond)
+				os.Exit(0)
+			}()
 		case "subscribe":
 			if unsubscribe != nil {
 				send(ctrlReply{Type: "ok"})

@@ -64,12 +64,13 @@ func main() {
 	}
 	bus := NewEventBus(abs)
 	rules := LoadRules(*rulesFile, *defaultsFile)
+	self := NewSelfCheck(abs)
 
 	ctl := &Control{
 		bus:   bus,
 		rules: rules,
 		reportFn: func() (string, error) {
-			return RenderReport(bus, rules, *reportDir, *name)
+			return RenderReport(bus, rules, self, *reportDir, *name)
 		},
 	}
 	asks := NewAsks(*askTimeout, func(a PendingAsk) {
@@ -92,7 +93,7 @@ func main() {
 	fmt.Printf("LISTENING %d\n", listener.Addr().(*net.TCPAddr).Port)
 	audit.Printf("SERVE root=%s socket=%s", abs, *socket)
 
-	pfs := NewPolicyFS(osfs.New(abs), abs, rules, bus, audit, asks)
+	pfs := NewPolicyFS(osfs.New(abs), abs, rules, bus, audit, asks, self)
 	handler := nfshelper.NewNullAuthHandler(pfs)
 	cached := nfshelper.NewCachingHandler(handler, 1024)
 	log.Fatal(nfs.Serve(listener, cached))

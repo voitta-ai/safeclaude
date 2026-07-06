@@ -204,6 +204,14 @@ final class EngineClient: ObservableObject, Identifiable {
         send(["cmd": "set_rule", "axis": axis, "category": category, "action": action])
     }
 
+    func setMeta(name: String, value: String) {
+        // optimistic: reflect immediately, engine echoes the full rules back
+        var m = rules.meta ?? .factory
+        m.set(key: name, value: value)
+        rules.meta = m
+        send(["cmd": "set_meta", "name": name, "value": value])
+    }
+
     func approve(path: String) {
         send(["cmd": "approve", "path": path])
         recentDenials.removeAll { $0.path == path }
@@ -217,6 +225,12 @@ final class EngineClient: ObservableObject, Identifiable {
 
     func openReport() {
         send(["cmd": "report"])
+    }
+
+    /// Ask the engine to exit (session deletion). The caller unmounts and
+    /// removes session state afterwards.
+    func requestShutdown() {
+        send(["cmd": "shutdown"])
     }
 
     /// Render the session report and deliver its path to the UI (instead of

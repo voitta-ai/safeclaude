@@ -45,7 +45,7 @@ struct DashboardView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(minWidth: 640, minHeight: 440)
+        .frame(minWidth: 860, minHeight: 440)
         .onReceive(NotificationCenter.default.publisher(for: .safeclaudeDenial)) { _ in
             tab = .sessions // a decision is pending — show it
         }
@@ -106,7 +106,9 @@ private struct SessionsTab: View {
             ScrollView {
                 VStack(spacing: 12) {
                     ForEach(manager.clients) { client in
-                        SessionCard(client: client, showReport: showReport)
+                        SessionCard(client: client, showReport: showReport) { wipeClaude in
+                            manager.delete(client, wipeClaudeState: wipeClaude)
+                        }
                     }
                 }
                 .padding(16)
@@ -118,6 +120,8 @@ private struct SessionsTab: View {
 private struct SessionCard: View {
     @ObservedObject var client: EngineClient
     let showReport: (String) -> Void
+    let onDelete: (_ wipeClaudeState: Bool) -> Void
+    @State private var confirmDelete = false
 
     private var artifactReads: UInt64 {
         allCategories.filter(\.isArtifact)
@@ -139,6 +143,22 @@ private struct SessionCard: View {
                     client.requestReport(showReport)
                 }
                 .disabled(!client.connected)
+                Button {
+                    confirmDelete = true
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .help("End this session and erase all its data")
+                .confirmationDialog(
+                    "Delete session “\(client.name)”?",
+                    isPresented: $confirmDelete, titleVisibility: .visible
+                ) {
+                    Button("Delete session data", role: .destructive) { onDelete(false) }
+                    Button("Delete + Claude Code history", role: .destructive) { onDelete(true) }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("Force-ends the session (any attached shell loses the mount) and erases its policy, audit logs and reports — the next run starts fresh from the default policy. The second option also wipes Claude Code's conversation history for this mount. Repo files are not touched.")
+                }
             }
 
             HStack(spacing: 18) {
@@ -320,11 +340,54 @@ private struct DecisionCard: View {
 private struct PolicyGrids: View {
     let rules: RuleSet
     let onChange: (_ axis: String, _ category: String, _ action: String) -> Void
+    let onMeta: (_ name: String, _ value: String) -> Void
+
+    private var meta: MetaControls { rules.meta ?? .factory }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 40) {
+        HStack(alignment: .top, spacing: 32) {
             grid(axis: "read", title: "Read policy", table: rules.read)
             grid(axis: "write", title: "Write policy", table: rules.write)
+            metaColumn
+        }
+    }
+
+    /// Third column: switches that sit between the per-path Approve/Deny
+    /// overrides and the category grids (overrides > meta > grid).
+    private var metaColumn: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Meta controls").font(.headline)
+
+            Toggle("Allow Claude writes", isOn: Binding(
+                get: { meta.allowClaudeWrites ?? true },
+                set: { onMeta("allow_claude_writes", $0 ? "on" : "off") }
+            ))
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .help("Allow every write to Claude files — skills, hooks, commands, agents, settings, memory, MCP config. When off, the write grid decides.")
+
+            ForEach(metaSwitches, id: \.key) { s in
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(s.label).font(.caption)
+                    Picker("", selection: Binding(
+                        get: { meta.mode(for: s.key) },
+                        set: { onMeta(s.key, $0) }
+                    )) {
+                        ForEach(metaModeChoices, id: \.key) { c in
+                            Text(c.label).tag(c.key)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .frame(width: 180)
+                }
+                .help(s.help)
+            }
+
+            Text("Self = not yet in git, or last commit is yours.\nMeta beats the grids; per-path Approve/Deny beats both.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 180, alignment: .leading)
         }
     }
 
@@ -407,9 +470,11 @@ private struct SessionPolicyPane: View {
                 Text("These rules apply to this session only, took their initial values from the default policy when the session started, and take effect immediately — no remount.")
                     .font(.caption).foregroundStyle(.secondary)
 
-                PolicyGrids(rules: client.rules) { axis, category, action in
+                PolicyGrids(rules: client.rules, onChange: { axis, category, action in
                     client.setRule(axis: axis, category: category, action: action)
-                }
+                }, onMeta: { name, value in
+                    client.setMeta(name: name, value: value)
+                })
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -429,9 +494,11 @@ private struct DefaultsTab: View {
                 Text("The template every new session inherits at start. Factory state blocks & notifies on everything — open up what you trust. Changing it does not affect sessions already running (use Session Policy for those).")
                     .font(.caption).foregroundStyle(.secondary)
 
-                PolicyGrids(rules: store.rules) { axis, category, action in
+                PolicyGrids(rules: store.rules, onChange: { axis, category, action in
                     store.set(axis: axis, category: category, action: action)
-                }
+                }, onMeta: { name, value in
+                    store.setMeta(name: name, value: value)
+                })
             }
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -36,6 +36,64 @@ final class SessionsManager: ObservableObject {
         clients.sort { $0.name < $1.name }
     }
 
+    /// Force-end a session and wipe every trace of it: engine, mount,
+    /// session dir (incl. rules.json), audit logs and reports — so the next
+    /// `safeclaude <repo>` starts as if the repo was never guarded.
+    /// wipeClaudeState additionally removes Claude Code's own per-project
+    /// state for the mount path (conversation history, project config).
+    func delete(_ client: EngineClient, wipeClaudeState: Bool) {
+        let name = client.name
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let sess = "\(sessionsDir)/\(name)"
+        let mount = "\(home)/.safeclaude/mounts/\(name)"
+        let enginePid = (try? String(contentsOfFile: "\(sess)/engine.pid", encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        client.requestShutdown() // graceful engine exit
+        client.shutdown()
+        clients.removeAll { $0.name == name }
+
+        Task.detached(priority: .userInitiated) {
+            try? await Task.sleep(for: .milliseconds(400))
+            if let s = enginePid, let pid = Int32(s) {
+                kill(pid, SIGTERM) // in case the socket shutdown didn't land
+            }
+            Self.run("/sbin/umount", "-f", mount)
+            let fm = FileManager.default
+            try? fm.removeItem(atPath: sess)
+            try? fm.removeItem(atPath: mount)
+            // logs: <name>-YYYYMMDD-HHMMSS.log · reports: session-<name>-….html
+            // (anchored timestamps so "myrepo" never matches "myrepo-2" files)
+            let esc = NSRegularExpression.escapedPattern(for: name)
+            Self.wipe(dir: "\(home)/.safeclaude/logs",
+                      matching: "^\(esc)-\\d{8}-\\d{6}\\.log$")
+            Self.wipe(dir: "\(home)/.safeclaude/reports",
+                      matching: "^session-\(esc)-\\d{8}-\\d{6}\\.html$")
+            if wipeClaudeState {
+                // Claude Code keys project state by path, non-alphanumerics → "-"
+                let slug = String(mount.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+                try? fm.removeItem(atPath: "\(home)/.claude/projects/\(slug)")
+            }
+        }
+    }
+
+    private nonisolated static func run(_ path: String, _ args: String...) {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        try? p.run()
+        p.waitUntilExit()
+    }
+
+    private nonisolated static func wipe(dir: String, matching pattern: String) {
+        let fm = FileManager.default
+        guard let names = try? fm.contentsOfDirectory(atPath: dir),
+              let re = try? NSRegularExpression(pattern: pattern) else { return }
+        for n in names where re.firstMatch(in: n, range: NSRange(n.startIndex..., in: n)) != nil {
+            try? fm.removeItem(atPath: "\(dir)/\(n)")
+        }
+    }
+
     var totalDenials: UInt64 { clients.reduce(0) { $0 + $1.stats.denials } }
     var anyConnected: Bool { clients.contains(where: \.connected) }
     /// Live Asks (paused operations) plus unhandled denials, across sessions.
