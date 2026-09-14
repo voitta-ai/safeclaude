@@ -25,9 +25,19 @@ jobs:
         env:
           BASE: ${{ github.base_ref }}
         run: |
+          set -euo pipefail
           git fetch --no-tags --depth=1 origin "$BASE"
-          old=$(git show "FETCH_HEAD:$VERSION_FILE" | tr -d '[:space:]')
           new=$(tr -d '[:space:]' < "$VERSION_FILE")
+          # Bootstrap: base branch predates this version file entirely.
+          if git cat-file -e "FETCH_HEAD:$VERSION_FILE" 2>/dev/null; then
+            old=$(git show "FETCH_HEAD:$VERSION_FILE" | tr -d '[:space:]')
+          else
+            old=""
+          fi
+          if [ -z "$old" ]; then
+            echo "Bootstrap: no $VERSION_FILE on $BASE; accepting $new."
+            exit 0
+          fi
           if [ "$old" = "$new" ]; then
             echo "::error::$VERSION_FILE is still $old - bump it."
             exit 1
@@ -51,6 +61,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           version=$(tr -d '[:space:]' < "$VERSION_FILE")
           if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
             echo "v$version is already tagged; nothing to release."
