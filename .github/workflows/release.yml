@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+    paths-ignore:
+      - '.github/**'
+      - '**.md'
+
+permissions:
+  contents: read
+
+env:
+  VERSION_FILE: VERSION
+
+jobs:
+  version-bumped:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Version must advance
+        env:
+          BASE: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 origin "$BASE"
+          new=$(tr -d '[:space:]' < "$VERSION_FILE")
+          # Bootstrap: base branch predates this version file entirely.
+          if git cat-file -e "FETCH_HEAD:$VERSION_FILE" 2>/dev/null; then
+            old=$(git show "FETCH_HEAD:$VERSION_FILE" | tr -d '[:space:]')
+          else
+            old=""
+          fi
+          if [ -z "$old" ]; then
+            echo "Bootstrap: no $VERSION_FILE on $BASE; accepting $new."
+            exit 0
+          fi
+          if [ "$old" = "$new" ]; then
+            echo "::error::$VERSION_FILE is still $old - bump it."
+            exit 1
+          fi
+          if [ "$(printf '%s\n%s\n' "$old" "$new" | sort -V | head -1)" != "$old" ]; then
+            echo "::error::$new does not advance past $old."
+            exit 1
+          fi
+          echo "$old -> $new"
+
+  tag-and-release:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag and release if the version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(tr -d '[:space:]' < "$VERSION_FILE")
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            tag_sha=$(git rev-parse "refs/tags/v$version^{commit}")
+            if [ "$tag_sha" = "$GITHUB_SHA" ]; then
+              echo "v$version is tagged on this commit."
+            else
+              echo "v$version already exists on $tag_sha, not this push ($GITHUB_SHA); this push did not bump the version."
+            fi
+            if gh release view "v$version" >/dev/null 2>&1; then
+              echo "Release for v$version already exists; nothing to do."
+            else
+              echo "No release for v$version yet; creating it at the existing tag."
+              gh release create "v$version" \
+                --title "v$version" \
+                --generate-notes
+            fi
+            exit 0
+          fi
+          gh release create "v$version" \
+            --title "v$version" \
+            --generate-notes \
+            --target "$GITHUB_SHA"
