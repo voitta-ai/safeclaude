@@ -64,7 +64,20 @@ jobs:
           set -euo pipefail
           version=$(tr -d '[:space:]' < "$VERSION_FILE")
           if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
-            echo "v$version is already tagged; nothing to release."
+            tag_sha=$(git rev-parse "refs/tags/v$version^{commit}")
+            if [ "$tag_sha" = "$GITHUB_SHA" ]; then
+              echo "v$version is tagged on this commit."
+            else
+              echo "v$version already exists on $tag_sha, not this push ($GITHUB_SHA); this push did not bump the version."
+            fi
+            if gh release view "v$version" >/dev/null 2>&1; then
+              echo "Release for v$version already exists; nothing to do."
+            else
+              echo "No release for v$version yet; creating it at the existing tag."
+              gh release create "v$version" \
+                --title "v$version" \
+                --generate-notes
+            fi
             exit 0
           fi
           gh release create "v$version" \
